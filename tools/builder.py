@@ -76,9 +76,11 @@ def build_opti_sche(base_model, config):
     elif sche_config.type == 'CosLR':
         scheduler = CosineLRScheduler(optimizer,
                                       t_initial=sche_config.kwargs.epochs,
-                                      t_mul=1,
+                                      cycle_mul=1,
+                                      #t_mul=1,
                                       lr_min=1e-6,
-                                      decay_rate=0.1,
+                                      cycle_decay=0.1,
+                                      #decay_rate=0.1,
                                       warmup_lr_init=1e-6,
                                       warmup_t=sche_config.kwargs.initial_epochs,
                                       cycle_limit=1,

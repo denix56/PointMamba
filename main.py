@@ -14,7 +14,7 @@ from utils.config import *
 import time
 import os
 import torch
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 import os
 import argparse
 from pathlib import Path
@@ -133,6 +133,7 @@ def get_args():
                                         args.exp_name,
                                         ('%s' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))
                                         )
+    print(args.experiment_path)
     args.tfboard_path = os.path.join('./experiments', Path(args.config).stem, Path(args.config).parent.stem, 'TFBoard',
                                      args.exp_name,
                                      ('%s' % datetime.datetime.now().strftime('%Y%m%d-%H%M%S'))

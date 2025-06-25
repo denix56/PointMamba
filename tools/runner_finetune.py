@@ -1,4 +1,5 @@
 import os
+import math
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,19 @@ from pointnet2_ops import pointnet2_utils
 from torchvision import transforms
 from sklearn.manifold import TSNE
 from matplotlib import pyplot as plt
+
+
+def tau_schedule(epoch, start_tau, max_tau, warmup_epochs, total_epochs):
+    if epoch < warmup_epochs:
+        # Linear warmup
+        progress = epoch / warmup_epochs
+        return start_tau + (max_tau - start_tau) * progress
+    elif epoch <= total_epochs:
+        # Cosine annealing: from max_tau to 0
+        anneal_progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+        return max_tau * 0.5 * (1 + math.cos(math.pi * anneal_progress))
+    else:
+        return 0.0
 
 train_transforms = transforms.Compose(
     [
@@ -122,6 +136,7 @@ def run_net(args, config, train_writer=None, val_writer=None):
     # training
     base_model.zero_grad()
     misc.summary_parameters(base_model, logger=logger)
+    start_tau = 0.0
 
     for epoch in range(start_epoch, config.max_epoch + 1):
         if args.distributed:
@@ -132,11 +147,13 @@ def run_net(args, config, train_writer=None, val_writer=None):
         batch_start_time = time.time()
         batch_time = AverageMeter()
         data_time = AverageMeter()
-        losses = AverageMeter(['loss', 'acc'])
+        losses = AverageMeter(['loss', 'acc', 'loss1', 'loss_policy'])
         num_iter = 0
         base_model.train()  # set model to training mode
 
         n_batches = len(train_dataloader)
+
+        tau = tau_schedule(epoch, start_tau, 1.0, 10, 50)
 
         # from calflops import calculate_flops
         # flops, macs, params = calculate_flops(base_model, input_shape=(1, 2048, 3), output_as_string=True,
@@ -170,15 +187,16 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
             fps_idx = pointnet2_utils.furthest_point_sample(points, point_all)  # (B, npoint)
             fps_idx = fps_idx[:, np.random.choice(point_all, npoints, False)]
-            points = pointnet2_utils.gather_operation(points.transpose(1, 2).contiguous(), fps_idx).transpose(1,
-                                                                                                              2).contiguous()  # (B, N, 3)
+            points = pointnet2_utils.gather_operation(points.transpose(1, 2).contiguous(), fps_idx).transpose(1, 2).contiguous()  # (B, N, 3)
             if 'scan' in args.config:
                 points = train_transforms(points)
             else:
                 points = train_transforms_raw(points)
             # points = train_transforms(points)
-            ret = base_model(points)
-            loss, acc = base_model.module.get_loss_acc(ret, label)
+            #with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                
+            ret, loss, loss1, loss2, acc = base_model(points, label, init_baseline=True, tau=tau)
+                #loss, acc = base_model.module.get_loss_acc(ret, label)
             _loss = loss
             _loss.backward()
             # forward
@@ -192,15 +210,17 @@ def run_net(args, config, train_writer=None, val_writer=None):
             if args.distributed:
                 loss = dist_utils.reduce_tensor(loss, args)
                 acc = dist_utils.reduce_tensor(acc, args)
-                losses.update([loss.item(), acc.item()])
+                losses.update([loss.item(), acc.item(), loss1.item(), loss2.item()])
             else:
-                losses.update([loss.item(), acc.item()])
+                losses.update([loss.item(), acc.item(), loss1.item(), loss2.item()])
 
             if args.distributed:
                 torch.cuda.synchronize()
 
             if train_writer is not None:
                 train_writer.add_scalar('Loss/Batch/Loss', loss.item(), n_itr)
+                train_writer.add_scalar('Loss/Batch/Loss_1', loss1.item(), n_itr)
+                train_writer.add_scalar('Loss/Batch/Loss_policy', loss2.item(), n_itr)
                 train_writer.add_scalar('Loss/Batch/TrainAcc', acc.item(), n_itr)
                 train_writer.add_scalar('Loss/Batch/LR', optimizer.param_groups[0]['lr'], n_itr)
 
@@ -221,6 +241,8 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
         if train_writer is not None:
             train_writer.add_scalar('Loss/Epoch/Loss', losses.avg(0), epoch)
+            train_writer.add_scalar('Loss/Epoch/Loss_1', losses.avg(2), epoch)
+            train_writer.add_scalar('Loss/Epoch/Loss_policy', losses.avg(3), epoch)
 
         print_log('[Training] EPOCH: %d EpochTime = %.3f (s) Losses = %s lr = %.6f' %
                   (epoch, epoch_end_time - epoch_start_time, ['%.4f' % l for l in losses.avg()],
@@ -276,7 +298,7 @@ def validate(base_model, test_dataloader, epoch, val_writer, args, config, logge
 
             points = misc.fps(points, npoints)
 
-            logits = base_model(points)
+            logits = base_model(points, vis=(idx == 0), epoch=epoch)
             target = label.view(-1)
 
             pred = logits.argmax(-1).view(-1)

@@ -94,6 +94,116 @@ class Group(nn.Module):  # FPS + KNN
         return neighborhood, center
 
 
+# ────────────────────────────────
+# Local-Norm-Pool helper
+# k-NN  ➜  L2-norm  ➜  2-layer MLP
+# ────────────────────────────────
+class LocalNormPool(nn.Module):
+    def __init__(self, k: int = 16, in_c: int = 128, out_c: int = 128):
+        super().__init__()
+        self.k = k
+        self.proj = nn.Sequential(
+            nn.Linear(in_c, out_c),
+            nn.GELU(),
+            nn.Linear(out_c, out_c),
+        )
+
+    def forward(self, xyz: torch.Tensor, feat: torch.Tensor) -> torch.Tensor:
+        """
+        xyz  : [B, G, 3]   group centres
+        feat : [B, G, C]   token embeddings
+        returns pooled features [B, G, C]
+        """
+        # k-nearest centres for each centre
+        idx = torch.cdist(xyz, xyz).topk(self.k, largest=False).indices  # [B,G,k]
+        B, G, C = feat.shape
+        k = idx.size(-1)
+        batch_idx = torch.arange(B, device=feat.device).view(B, 1, 1).expand(-1, G, k)
+        neigh = feat[batch_idx, idx]  # [B,G,k,C]
+        # ----------------------------------------------------------------
+
+        pooled = neigh.norm(dim=-2)  # L2 over k
+        return self.proj(pooled)
+
+
+# ──────────────────────────────────────────────────────────────
+# Local Geometric Pooling (learnable-k)  &  CoFE-SE definitions
+# ──────────────────────────────────────────────────────────────
+class LGP(nn.Module):
+    def __init__(self, C, k_init=16):
+        super().__init__()
+        self.logk = nn.Parameter(torch.log(torch.tensor(float(k_init))))
+        self.proj = nn.Sequential(
+            nn.Linear(C + 1, C), nn.GELU(), nn.Linear(C, C)
+        )
+
+    def forward(self, xyz, feat):                     # xyz:[B,N,3]  feat:[B,N,C]
+        k  = int(torch.clamp(self.logk.exp(), 4, 32).round().item())
+        idx = torch.cdist(xyz, xyz).topk(k, largest=False).indices     # [B,N,k]
+
+        B, N, C = feat.shape
+        batch = torch.arange(B, device=feat.device).view(B, 1, 1).expand(-1, N, k)
+
+        neigh_f = feat[batch, idx]                                       # [B,N,k,C]
+        neigh_x = xyz[batch, idx]                                        # [B,N,k,3]
+
+        delta_f = F.layer_norm(neigh_f - feat.unsqueeze(2), normalized_shape=(feat.size(-1),))
+        offset  = neigh_x - neigh_x.mean(2, keepdim=True)
+        sigma   = offset.std(2, keepdim=True) + 1e-6
+        dist    = (offset / sigma).norm(dim=-1, keepdim=True)            # [B,N,k,1]
+        w       = torch.exp(-0.5 * dist)
+
+        fused   = torch.cat([delta_f * w, dist], -1).mean(2)             # [B,N,C+1]
+        return self.proj(fused)                                          # [B,N,C]
+
+
+class CoFE_SE(nn.Module):
+    def __init__(self, C, groups=4):
+        super().__init__()
+        self.dw = nn.Conv1d(C, C, 3, padding=1, groups=C)
+        self.norm = nn.GroupNorm(groups, C)
+        self.se   = nn.Sequential(nn.Linear(C, C // 4), nn.GELU(),
+                                  nn.Linear(C // 4, C), nn.Sigmoid())
+        self.mix  = nn.Linear(C, C)
+
+    def forward(self, x):                              # x [B,N,C]
+        a = F.gelu(self.dw(x.transpose(1, 2))).transpose(1, 2)
+        g = self.se(x.mean(1)).unsqueeze(1)            # [B,1,C]
+        w = F.softmax((a + x * g).mean(-1, keepdim=True), dim=1)
+        return self.mix(x * w)
+
+
+# ──────────────────────────────────────────────────────────────
+# Hybrid-Emba3D Mixer (LGP → Bi-Mamba → CoFE-SE)
+# ──────────────────────────────────────────────────────────────
+class EmbaMambaLayer(nn.Module):
+    """
+    Wraps one Mamba SSM block with:
+        1. Local-Geometric-Pooling  (LGP)
+        2. Bidirectional Mamba + Hadamard fusion
+        3. CoFE-SE re-weighting
+    """
+    def __init__(self, d_model, layer_idx, k_init=16, groups=4, **kw):
+        super().__init__()
+        from mamba_ssm.modules.mamba_simple import Mamba          # local import
+        self.lgp   = LGP(d_model, k_init)
+        self.mamba = Mamba(d_model, layer_idx=layer_idx, **kw)
+        self.cofe  = CoFE_SE(d_model, groups)
+
+    def forward(self, feat, xyz, inference_params=None):         # feat:[B,N,C]
+        # 1. LGP
+        feat = feat + self.lgp(xyz, feat)
+
+        # 2. Bidirectional Mamba + Hadamard
+        y_fwd = self.mamba(feat, inference_params=inference_params)
+        y_rev_tmp = self.mamba(torch.flip(feat, [1]), inference_params=inference_params)
+        y_rev = torch.flip(y_rev_tmp, [1])
+        feat = feat + y_fwd + y_rev + y_fwd * y_rev                # fusion
+
+        # 3. CoFE-SE
+        feat = feat + self.cofe(feat)
+        return feat
+
 # https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
 def _init_weights(
         module,
@@ -172,9 +282,15 @@ def create_block(
 
     if ssm_cfg is None:
         ssm_cfg = {}
+    else:
+        ssm_cfg = ssm_cfg.copy()
     factory_kwargs = {"device": device, "dtype": dtype}
 
-    mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
+    emba = ssm_cfg.pop("emba", False)  # ← YAML flag
+    if emba:
+        mixer_cls = partial(EmbaMambaLayer, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
+    else:
+        mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
@@ -250,18 +366,19 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, input_ids, pos, inference_params=None):
+    def forward(self, input_ids, pos, xyz=None, inference_params=None):
         hidden_states = input_ids + pos
-
         for layer in self.layers:
+            # EmbaMambaLayer expects xyz; plain Mamba ignores it
             hidden_states = layer(
-                hidden_states, inference_params=inference_params
+                hidden_states,
+                xyz=xyz if xyz is not None else hidden_states.new_zeros(
+                    hidden_states.shape[0], hidden_states.shape[1], 3
+                ),
+                inference_params=inference_params,
             )
             hidden_states = self.drop_out(hidden_states)
-
-        hidden_states = self.norm_f(hidden_states.to(dtype=self.norm_f.weight.dtype))
-
-        return hidden_states
+        return self.norm_f(hidden_states.to(dtype=self.norm_f.weight.dtype))
 
 
 @MODELS.register_module()
@@ -281,6 +398,13 @@ class PointMambaScan(nn.Module):
         self.group_divider = Group(num_group=self.num_group, group_size=self.group_size)
 
         self.encoder = Encoder(encoder_channel=self.encoder_dims)
+
+        # Local-Norm-Pool (HiP-Mamba enhancement)
+        self.local_pool = LocalNormPool(
+            k=getattr(config, "local_k", 16),  # YAML or default 16
+            in_c=self.encoder_dims,
+            out_c=self.encoder_dims,  # keep feature dim unchanged
+        )
 
         self.use_cls_token = False if not hasattr(self.config, "use_cls_token") else self.config.use_cls_token
         drop_path = 0. if not hasattr(self.config, "drop_path") else self.config.drop_path
@@ -391,6 +515,8 @@ class PointMambaScan(nn.Module):
     def forward(self, pts):
         neighborhood, center = self.group_divider(pts)
         group_input_tokens = self.encoder(neighborhood)  # B G N
+        # enrich each group token with its k-NN context
+        group_input_tokens = self.local_pool(center, group_input_tokens)
         pos = self.pos_embed(center)  # B G C
 
         # # reordering strategy
@@ -460,6 +586,13 @@ class MaskMamba(nn.Module):
         self.encoder_dims = config.mamba_config.encoder_dims
         self.encoder = Encoder(encoder_channel=self.encoder_dims)
 
+        # Local-Norm-Pool (HiP-Mamba enhancement)
+        self.local_pool = LocalNormPool(
+            k=getattr(config, "local_k", 16),  # YAML or default 16
+            in_c=self.encoder_dims,
+            out_c=self.encoder_dims,  # keep feature dim unchanged
+        )
+
         self.mask_type = config.mamba_config.mask_type
         self.pos_embed = nn.Sequential(
             nn.Linear(3, 128),
@@ -471,7 +604,9 @@ class MaskMamba(nn.Module):
         self.blocks = MixerModel(d_model=self.trans_dim,
                                  n_layer=self.depth,
                                  rms_norm=self.config.rms_norm,
-                                 drop_path=dpr)
+                                 drop_path=dpr,
+                                 ssm_cfg={'emba': config.mamba_config.emba}
+                                 )
 
         self.OrderScale_gamma_1, self.OrderScale_beta_1 = init_OrderScale(self.trans_dim)
         self.OrderScale_gamma_2, self.OrderScale_beta_2 = init_OrderScale(self.trans_dim)
@@ -545,31 +680,39 @@ class MaskMamba(nn.Module):
 
         return overall_mask.to(center.device)  # B G
 
-    def forward(self, neighborhood, center, order, order_index, noaug=False):  # generate mask
-        if self.mask_type == 'rand':
-            bool_masked_pos = self._mask_center_rand(center, noaug=noaug)  # B G
+    def forward(self, neighborhood, center, order, order_index, noaug=False):
+        # ---------- 1. build mask (unchanged) ----------
+        if self.mask_type == "rand":
+            bool_masked_pos = self._mask_center_rand(center, noaug=noaug)
         else:
             bool_masked_pos = self._mask_center_block(center, noaug=noaug)
 
-        group_input_tokens = self.encoder(neighborhood)  # B G C
+        # ---------- 2. encode & local pool ----------
+        group_input_tokens = self.encoder(neighborhood)  # [B,G,C]
+        group_input_tokens = self.local_pool(center, group_input_tokens)
 
+        # ---------- 3. OrderScale (unchanged) ----------
         if order_index == 0:
-            group_input_tokens = apply_OrderScale(group_input_tokens, self.OrderScale_gamma_1, self.OrderScale_beta_1)
+            group_input_tokens = apply_OrderScale(
+                group_input_tokens, self.OrderScale_gamma_1, self.OrderScale_beta_1
+            )
         elif order_index == 1:
-            group_input_tokens = apply_OrderScale(group_input_tokens, self.OrderScale_gamma_2, self.OrderScale_beta_2)
+            group_input_tokens = apply_OrderScale(
+                group_input_tokens, self.OrderScale_gamma_2, self.OrderScale_beta_2
+            )
         else:
-            assert False
+            raise ValueError("order_index must be 0 or 1")
 
-        batch_size, seq_len, C = group_input_tokens.size()
-        #
-        x_vis = group_input_tokens[~bool_masked_pos].reshape(batch_size, -1, C)
-        # add pos embedding
-        # mask pos center
-        masked_center = center[~bool_masked_pos].reshape(batch_size, -1, 3)
-        pos = self.pos_embed(masked_center)
+        # ---------- 4. slice visible tokens & coords ----------
+        B, G, C = group_input_tokens.shape
+        x_vis = group_input_tokens[~bool_masked_pos].reshape(B, -1, C)  # [B,V,C]
+        xyz_vis = center[~bool_masked_pos].reshape(B, -1, 3)  # [B,V,3]
+        pos = self.pos_embed(xyz_vis)  # [B,V,C]
 
-        x_vis = self.blocks(x_vis, pos)
+        # ---------- 5. run through Emba-Mamba stack ----------
+        x_vis = self.blocks(x_vis, pos, xyz_vis)  # ← note extra xyz_vis arg
 
+        # ---------- 6. return (unchanged signature) ----------
         return x_vis, bool_masked_pos, group_input_tokens
 
 
@@ -580,7 +723,8 @@ class MambaDecoder(nn.Module):
         self.blocks = MixerModel(d_model=embed_dim,
                                  n_layer=depth,
                                  rms_norm=config.rms_norm,
-                                 drop_path=drop_path)
+                                 drop_path=drop_path,
+                                 ssm_cfg={'emba': config.mamba_config.emba})
         self.head = nn.Identity()
 
         self.apply(self._init_weights)
@@ -594,11 +738,10 @@ class MambaDecoder(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, x, pos, mask_pos):
-        B, _, C = x.shape
-        x = self.blocks(x, pos)
-
-        x = self.head(x[mask_pos, :].view(B, -1, C))  # only return the mask tokens predict pixel
+    def forward(self, x, pos, xyz, mask_pos):
+        """ x/pos/xyz: full tokens   mask_pos: bool mask for masked centres """
+        x = self.blocks(x, pos, xyz)              # xyz forwarded to each layer
+        x = self.head(x[mask_pos, :].view(x.size(0), -1, x.size(-1)))
         return x
 
     # def forward(self, x, pos, N):
@@ -683,16 +826,16 @@ class Point_MAE_Mamba_serializationV2(nn.Module):
         x_full[~mask] = x_vis.reshape(-1, C)
         x_full[mask] = self.mask_token.reshape(-1, C)
         pos_full = torch.zeros_like(group_input_tokens, device=group_input_tokens.device)
-        pos_full[~mask] = pos_emd_vis.reshape(-1, C)
-        pos_full[mask] = pos_emd_mask.reshape(-1, C)
+        pos_full[~mask] = pos_emd_vis.reshape(-1, C).to(pos_full.dtype)
+        pos_full[mask] = pos_emd_mask.reshape(-1, C).to(pos_full.dtype)
 
-        x_rec = self.MAE_decoder(x_full, pos_full, mask)
+        x_rec = self.MAE_decoder(x_full, pos_full, center, mask)
 
         B, M, C = x_rec.shape
         rebuild_points = self.increase_dim(x_rec.transpose(1, 2)).transpose(1, 2).reshape(B * M, -1, 3)  # B M 1024
 
         gt_points = neighborhood[mask].reshape(B * M, -1, 3)
-        loss1 = self.loss_func(rebuild_points, gt_points)
+        loss1 = self.loss_func(rebuild_points.to(torch.float32), gt_points.to(torch.float32))
 
         if vis:  # visualization
             vis_points = neighborhood[~mask].reshape(B * (self.num_group - M), -1, 3)

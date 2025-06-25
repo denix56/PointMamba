@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import os
@@ -53,6 +54,19 @@ def evaluate_svm(train_features, train_labels, test_features, test_labels):
     return np.sum(test_labels == pred) * 1. / pred.shape[0]
 
 
+def tau_schedule(epoch, start_tau, max_tau, warmup_epochs, total_epochs):
+    if epoch < warmup_epochs:
+        # Linear warmup
+        progress = epoch / warmup_epochs
+        return start_tau + (max_tau - start_tau) * progress
+    elif epoch <= total_epochs:
+        # Cosine annealing: from max_tau to 0
+        anneal_progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+        return max_tau * 0.5 * (1 + math.cos(math.pi * anneal_progress))
+    else:
+        return 0.0
+
+
 def run_net(args, config, train_writer=None, val_writer=None):
     logger = get_logger(args.log_name)
     # build dataset
@@ -102,6 +116,8 @@ def run_net(args, config, train_writer=None, val_writer=None):
     # trainval
     # training
     base_model.zero_grad()
+    start_tau = 0.5
+
     for epoch in range(start_epoch, config.max_epoch + 1):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -111,12 +127,14 @@ def run_net(args, config, train_writer=None, val_writer=None):
         batch_start_time = time.time()
         batch_time = AverageMeter()
         data_time = AverageMeter()
-        losses = AverageMeter(['Loss'])
+        losses = AverageMeter(['Loss', 'Loss_1', 'Loss_policy'])
 
         num_iter = 0
 
         base_model.train()  # set model to training mode
         n_batches = len(train_dataloader)
+        tau = tau_schedule(epoch, start_tau, 1.0, 50, 150)
+
         for idx, (taxonomy_ids, model_ids, data) in enumerate(train_dataloader):
             num_iter += 1
             n_itr = epoch * n_batches + idx
@@ -135,7 +153,9 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
             assert points.size(1) == npoints
             points = train_transforms(points)
-            loss = base_model(points)
+
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                loss, loss1, loss2 = base_model(points, tau=tau, init_baseline=epoch>5)
             try:
                 loss.backward()
                 # print("Using one GPU")
@@ -152,15 +172,17 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
             if args.distributed:
                 loss = dist_utils.reduce_tensor(loss, args)
-                losses.update([loss.item() * 1000])
+                losses.update([loss.item(), loss1.item(), loss2.item()])
             else:
-                losses.update([loss.item() * 1000])
+                losses.update([loss.item(), loss1.item(), loss2.item()])
 
             if args.distributed:
                 torch.cuda.synchronize()
 
             if train_writer is not None:
                 train_writer.add_scalar('Loss/Batch/Loss', loss.item(), n_itr)
+                train_writer.add_scalar('Loss/Batch/Loss_1', loss1.item(), n_itr)
+                train_writer.add_scalar('Loss/Batch/Loss_policy', loss2.item(), n_itr)
                 train_writer.add_scalar('Loss/Batch/LR', optimizer.param_groups[0]['lr'], n_itr)
 
             batch_time.update(time.time() - batch_start_time)
@@ -178,7 +200,9 @@ def run_net(args, config, train_writer=None, val_writer=None):
         epoch_end_time = time.time()
 
         if train_writer is not None:
-            train_writer.add_scalar('Loss/Epoch/Loss_1', losses.avg(0), epoch)
+            train_writer.add_scalar('Loss/Epoch/Loss', losses.avg(0), epoch)
+            train_writer.add_scalar('Loss/Epoch/Loss_1', losses.avg(1), epoch)
+            train_writer.add_scalar('Loss/Epoch/Loss_policy', losses.avg(2), epoch)
         print_log('[Training] EPOCH: %d EpochTime = %.3f (s) Losses = %s lr = %.6f' %
                   (epoch, epoch_end_time - epoch_start_time, ['%.4f' % l for l in losses.avg()],
                    optimizer.param_groups[0]['lr']), logger=logger)
