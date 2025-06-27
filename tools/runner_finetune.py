@@ -153,7 +153,7 @@ def run_net(args, config, train_writer=None, val_writer=None):
 
         n_batches = len(train_dataloader)
 
-        tau = tau_schedule(epoch, start_tau, 1.0, 10, 50)
+        tau = tau_schedule(epoch, start_tau, 1.0, 50, 300)
 
         # from calflops import calculate_flops
         # flops, macs, params = calculate_flops(base_model, input_shape=(1, 2048, 3), output_as_string=True,
